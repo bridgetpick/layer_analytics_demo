@@ -6,25 +6,42 @@ import pandas as pd
 import requests
 import tempfile
 from rasterio.transform import xy
+from shapely.geometry import box
 import matplotlib.pyplot as plt
+import os
 
 st.set_page_config(page_title="Raster Distribution Viewer", layout="wide")
 st.title("Raster Distribution Analysis by Country")
 
 # === USER INPUTS ===
-uploaded_file = st.file_uploader("Upload GeoTIFF file", type=["tif"])
+
+# Directory containing your GeoTIFF files (must be relative to this script's location)
+tif_dir = "tif_directory"  # Make sure this folder exists and is at the same level as this script
+if not os.path.isdir(tif_dir):
+    st.error(f"Directory '{tif_dir}' not found. Please check the path.")
+    st.stop()
+
+# Dropdown menu to select a .tif file
+available_tifs = [f for f in os.listdir(tif_dir) if f.endswith(".tif")]
+if not available_tifs:
+    st.warning("No .tif files found in the directory.")
+    st.stop()
+
+selected_filename = st.selectbox("Select a GeoTIFF file", available_tifs)
+uploaded_file = os.path.join(tif_dir, selected_filename)
+st.success(f"Loaded: {selected_filename}")
+
+# Other controls
 value_min = st.slider("Minimum Value", 0.0, 100.0, 95.0)
 value_max = st.slider("Maximum Value", 0.0, 100.0, 100.0)
 top_n = st.number_input("Top N Countries to Display", min_value=1, value=10)
 
-# === HELPER FUNCTION ===
 def clean_label(label, max_chars=12):
-    """Wrap long country names"""
     return '\n'.join([label[i:i+max_chars] for i in range(0, len(label), max_chars)])
 
-# === MAIN ANALYSIS ===
+# === MAIN PROCESSING ===
 if uploaded_file:
-    # Download country boundaries
+    # Load world boundaries
     url = "https://github.com/nvkelso/natural-earth-vector/raw/master/geojson/ne_110m_admin_0_countries.geojson"
     response = requests.get(url)
     with tempfile.NamedTemporaryFile(delete=False, suffix=".geojson") as tmpfile:
@@ -40,7 +57,7 @@ if uploaded_file:
         band = np.where(band == nodata, np.nan, band)
         band_flat = band[~np.isnan(band)]
 
-        # Raw raster histogram
+        # Histogram
         st.subheader("Histogram of All Raster Values")
         fig1, ax1 = plt.subplots()
         ax1.hist(band_flat, bins=50, color='steelblue', edgecolor='black')
@@ -56,27 +73,49 @@ if uploaded_file:
         if matched_pixels == 0:
             st.warning("No pixels found in the specified range.")
         else:
-            pixel_area_km2 = (transform[0] * -transform[4]) / 1e6
             rows, cols = np.where(match_mask)
             xs, ys = xy(transform, rows, cols)
-            points = gpd.GeoDataFrame(geometry=gpd.points_from_xy(xs, ys), crs=crs)
 
-            if points.crs != world.crs:
-                points = points.to_crs(world.crs)
+            # Build square polygons for each matched pixel
+            pixel_width = transform[0]
+            pixel_height = -transform[4]
+            polygons = [
+                box(x - pixel_width / 2, y - pixel_height / 2,
+                    x + pixel_width / 2, y + pixel_height / 2)
+                for x, y in zip(xs, ys)
+            ]
+            pixels = gpd.GeoDataFrame(geometry=polygons, crs=crs)
 
-            joined = gpd.sjoin(points, world, how="inner", predicate="intersects")
-            summary = joined.groupby("ADMIN").size().reset_index(name="matched_pixels")
-            summary["area_km2"] = summary["matched_pixels"] * pixel_area_km2
-            summary["area_ha"] = summary["area_km2"] * 100
-            world["country_area_km2"] = world.geometry.area / 1e6
-            summary = summary.merge(world[["ADMIN", "country_area_km2"]], on="ADMIN", how="left")
-            summary["percent_covered"] = 100 * summary["area_km2"] / summary["country_area_km2"]
+            # Reproject to equal-area CRS
+            equal_area_crs = "EPSG:6933"
+            pixels = pixels.to_crs(equal_area_crs)
+            world_proj = world.to_crs(equal_area_crs)
 
+            # Calculate pixel area
+            pixels["pixel_area_km2"] = pixels.geometry.area / 1e6
+
+            # Spatial join
+            joined = gpd.sjoin(pixels, world_proj, how="inner", predicate="intersects")
+
+            # Aggregate by country
+            summary = joined.groupby("ADMIN").agg(
+                matched_pixels=("geometry", "count"),
+                area_km2=("pixel_area_km2", "sum")
+            ).reset_index()
+
+            # Country area and coverage
+            world_proj["country_area_km2"] = world_proj.geometry.area / 1e6
+            summary = summary.merge(world_proj[["ADMIN", "country_area_km2"]], on="ADMIN", how="left")
+            summary["percent_covered"] = (100 * summary["area_km2"] / summary["country_area_km2"]).round(4)
+            summary["area_km2"] = summary["area_km2"].round(2)
+
+            # Display table
+            display_summary = summary[["ADMIN", "matched_pixels", "area_km2", "percent_covered"]]
             st.subheader("Country Summary Table")
-            st.dataframe(summary.sort_values("matched_pixels", ascending=False))
+            st.dataframe(display_summary.sort_values("matched_pixels", ascending=False))
 
-            # === Plot 1: Top countries by pixel count ===
-            top_summary = summary.sort_values("matched_pixels", ascending=False).head(top_n)
+            # Bar plot: matched pixels
+            top_summary = display_summary.sort_values("matched_pixels", ascending=False).head(top_n)
             top_summary["ADMIN"] = top_summary["ADMIN"].apply(clean_label)
 
             st.subheader(f"Top {top_n} Countries by Matched Pixels")
@@ -90,8 +129,8 @@ if uploaded_file:
             plt.tight_layout()
             st.pyplot(fig2)
 
-            # === Plot 2: Top countries by % covered ===
-            top_covered = summary.sort_values("percent_covered", ascending=False).head(top_n)
+            # Bar plot: percent covered
+            top_covered = display_summary.sort_values("percent_covered", ascending=False).head(top_n)
             top_covered["ADMIN"] = top_covered["ADMIN"].apply(clean_label)
 
             st.subheader(f"Top {top_n} Countries by Percent of Area Covered")
