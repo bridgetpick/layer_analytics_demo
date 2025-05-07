@@ -1,0 +1,7 @@
+streamlit
+geopandas
+rasterio
+matplotlib
+numpy
+pandas
+requests
